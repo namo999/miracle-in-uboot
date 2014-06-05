@@ -1,0 +1,15 @@
+customize auto stop in uboot
+
+
+file name : boardfile in /include/config/<boardfile.h>
+
+@@ -92,6 +92,14 @@
+
+ # define CONFIG_BOOTDELAY       3   /* set to negative value for no autoboot */
+
+#define CONFIG_AUTOBOOT_KEYED       /* use key strings to stop autoboot */
+#define CONFIG_AUTOBOOT_STOP_STR  "halt"  /* easy to stop for now*/
+#define CONFIG_SILENT_CONSOLE      1   /* To stop prints on console */
+
+#define CONFIG_AUTOBOOT_PROMPT          \
+    "Enter halt in %d seconds to stop autoboot.\n", bootdelay
