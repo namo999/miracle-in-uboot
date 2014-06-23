@@ -30,6 +30,7 @@
 #include <linux/usb/input.h>
 #include <linux/input.h>
 #include <linux/hid.h>
+#include <linux/uaccess.h>
 
 #define DRIVER_AUTHOR "Raivis Rengelis <raivis@rrkb.lv>"
 #define DRIVER_DESC "3M EX111 HID touchscreen driver"
@@ -39,20 +40,101 @@
 
 #define USB_PRODUCT_ID_3M				0x0596
 #define USB_VENDOR_ID_3MEX111			0x0003
-#define USB_PRODUCT_ID_USB_MOUSE		0x0461
-#define USB_VENDOR_ID_USB_MOUSE			0x4d81
+#define USB_PRODUCT_ID_USB_MOUSE		0x045e
+#define USB_VENDOR_ID_USB_MOUSE			0x00cb
 
 #endif
+
+
+#if 0
+
+// CTRL numbers of commands define
+#define TSCRN_SOFT_RESET        73
+#define TSCRN_HARD_RESET        74
+#define TSCRN_CALIBRATE         75
+#define TSCRN_CONTROLLER_STATUS 76
+#define TSCRN_RESTORE_DEFAULTS  77
+#define TSCRN_CONTROLLER_ID     78
+#define TSCRN_REPORT_ENABLE     79
+#define TSCRN_CLEAR_HALT        80
+#define TSCRN_USER_REQUEST      81
+#define TSCRN_CALIBRATION       82
+
+// define raport sizes
+#define TSCRN_USB_RAPORT_SIZE_DATA      11
+
+// device requests define
+#define TSCRN_USB_REQUEST_RESET         7
+#define TSCRN_USB_REQUEST_CALIBRATION   4
+#define TSCRN_USB_REQUEST_STATUS        6
+#define TSCRN_USB_REQUEST_RESTORE_DEFAULTS 8
+#define TSCRN_USB_REQUEST_CONTROLLER_ID 10
+
+#define TSCRN_USB_PARAM_SOFT_RESET      1
+#define TSCRN_USB_PARAM_HARD_RESET      2
+//        for calibrate request
+#define TSCRN_EXTENDED_CALIBRATION_TYPE        1
+#define TSCRN_CORNER_CALIBRATION_TYPE           2
+
+// define raport sizes
+#define TSCRN_USB_RAPORT_SIZE_DATA      11
+#define TSCRN_USB_RAPORT_SIZE_STATUS    8
+#define TSCRN_USB_RAPORT_SIZE_ID        16
+
+#define IBUF_SIZE TSCRN_USB_RAPORT_SIZE_ID
+//input data buffer 12 * data raports
+#define OBUF_SIZE TSCRN_USB_RAPORT_SIZE_DATA*12
+#endif
+
+typedef struct usb_packet {
+
+   unsigned char bmRequestType;
+   unsigned char bRequest;
+   unsigned short wValue;
+   unsigned short wIndex;
+   unsigned short wLength;
+   char *data_stage;
+   };
+
+
+#define COMMAND_REQUEST	_IOWR('U', 1, struct usb_packet)
+
 
 static int swap_xy;
 module_param(swap_xy, bool, 0644);
 MODULE_PARM_DESC(swap_xy, "If set X and Y axes are swapped.");
 
-#define REPT_SIZE 8
+#define REPT_SIZE 17
 #define MIN_XC 0x0
 #define MAX_XC 0x3FFF
 #define MIN_YC 0x0
 #define MAX_YC 0x3FFF
+
+#if 0
+struct tscrn_usb_data
+{
+  struct usb_device *dev;
+  wait_queue_head_t wait;
+  struct urb irq;
+  struct urb ctrlin;
+  struct urb ctrlout;
+  struct usb_packet *setup_packet;     // for control transfers
+  unsigned int ifnum;	        // Interface number of the USB device
+  unsigned char minor;
+  unsigned char data[TSCRN_USB_RAPORT_SIZE_DATA];       // Data buffer X-Y, and button
+  int nLoopCounter;             // number of data packet last received +1
+  char isopen;		        // Not zero if the device is open
+  char present;		        // Not zero if device is present
+  unsigned char *obuf, *ibuf;	// transfer buffers
+  unsigned char *pToRead,*pToWrite;// pointers to toRead cell of buffer and to toWrite one
+  char intr_ep;                 // Endpoint assignments_
+  struct input_dev input_dev;   // to work as an input device driver
+
+};
+
+#define TSCRN_MAX_MNR 16
+static struct tscrn_usb_data *p_tscrn_table[TSCRN_MAX_MNR] = { NULL, /* ... */};
+#endif
 
 struct ex111_usb {
 	unsigned char *data;
@@ -67,11 +149,23 @@ struct ex111_usb {
 	void *priv;
 	unsigned int intrpipe;
 	struct work_struct reset_pipe_work;
-struct usb_device *usbdev;
+//struct usb_device *usbdev;
 
 	int x, y;
-	int touch, press;
+	int touch;
 };
+#if 0
+static void ctrl_touchscreen(struct urb *urb)
+{
+  struct tscrn_usb_data *tscrn = urb->context;
+  printk("ctrl_touchscreen(%d): status=%d", tscrn->minor, urb->status);
+
+  if (waitqueue_active(&tscrn->wait))
+    wake_up_interruptible(&tscrn->wait);
+  return;
+};
+#endif
+
 
 static int ex111_init(struct ex111_usb *ex111)
 {
@@ -86,15 +180,20 @@ static int ex111_init(struct ex111_usb *ex111)
 	buf[0] = 0x10;
 	buf[1] = 0x12;
 	buf[2] = 0x01;
+	buf[3] = 0x00;
+	buf[4] = 0x00;
+	buf[5] = 0x00;
+	buf[6] = 0x00;
+	buf[7] = 0x00;
 
 	ret = usb_control_msg(udev, usb_sndctrlpipe(udev, 0),
 			HID_REQ_SET_REPORT,
 			USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
 			0x0310, 0, (void *)buf, 0x8, USB_CTRL_SET_TIMEOUT);
-	printk(KERN_ERR "%s - usb_control_msg - EX111_RESET - bytes|err: %d",
+	printk("%s - usb_control_msg - EX111_RESET - bytes|err:%d\n",
 	    __func__, ret);
 	if (ret < 0)
-		goto bailout;
+//		goto init_out;
 
 	do {
 		msleep(100);
@@ -104,27 +203,31 @@ static int ex111_init(struct ex111_usb *ex111)
 				HID_REQ_GET_REPORT,
 				USB_DIR_IN | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
 				0x0380, 0, (void *)buf, 0x14, USB_CTRL_SET_TIMEOUT);
-		printk(KERN_ERR "%s - usb_control_msg - EX111_STATUS_REQ - bytes|err: %d",
+		printk("%s - usb_control_msg - EX111_STATUS_REQ - bytes|err:%d\n",
 				__func__, ret);
 	} while (buf[3] == 0x01);
-	printk(KERN_ERR "%s - EX111_STATUS_REQ buf[3]: %x", __func__, buf[3]);
+	printk("%s - EX111_STATUS_REQ buf[3]: %x", __func__, buf[3]);
 	if (ret < 0)
-		goto bailout;
+//		goto init_out;
 
 	memset(buf,0,32);
 	buf[0] = 0x10;
 	buf[1] = 0x10;
 	buf[2] = 0x01;
 	buf[3] = 0x01;
+	buf[4] = 0x00;
+	buf[5] = 0x00;
+	buf[6] = 0x00;
+	buf[7] = 0x00;
 
 	ret = usb_control_msg(udev, usb_sndctrlpipe(udev, 0),
 			HID_REQ_SET_REPORT,
 			USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
 			0x0310, 0, (void *)buf, 0x8, USB_CTRL_SET_TIMEOUT);
-	printk(KERN_ERR "%s - usb_control_msg - EX111_SET_ASYNC - bytes|err: %d",
+	printk("%s - usb_control_msg - EX111_SET_ASYNC - bytes|err:%d\n",
 	    __func__, ret);
 	if (ret < 0)
-		goto bailout;
+//		goto init_out;
 
 	do {
 		memset(buf,0,32);
@@ -133,16 +236,16 @@ static int ex111_init(struct ex111_usb *ex111)
 				HID_REQ_GET_REPORT,
 				USB_DIR_IN | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
 				0x0380, 0, (void *)buf, 0x14, USB_CTRL_SET_TIMEOUT);
-		printk(KERN_ERR "%s - usb_control_msg - EX111_STATUS_REQ - bytes|err: %d",
+		printk("%s - usb_control_msg - EX111_STATUS_REQ - bytes|err:%d\n",
 				__func__, ret);
 	} while (buf[3] == 0x01);
-	printk(KERN_ERR "%s - EX111_STATUS_REQ buf[3]: %x", __func__, buf[3]);
+	printk("%s - EX111_STATUS_REQ buf[3]: %x", __func__, buf[3]);
 
-bailout:
+//init_out:
 	kfree(buf);
 
-	if (ret < 0)
-		return ret;
+//	if (ret < 0)
+//		return ret;
 
 	return 0;
 }
@@ -154,28 +257,27 @@ static void reset_halted_pipe(struct work_struct *ws)
 	struct usb_device *udev = interface_to_usbdev(ex111->interface);
 
 	int rv = usb_clear_halt(udev, ex111->intrpipe);
-	printk(KERN_ERR "%s - usb_clear_halt SR",__func__);
+	printk("%s - usb_clear_halt SR",__func__);
 
 	if (rv != 0)
-		printk(KERN_ERR "%s - usb_clear_halt failed with %d",__func__,rv);
+		printk("%s - usb_clear_halt failed with %d",__func__,rv);
 
 	rv = ex111_init(ex111);
 	if (rv != 0)
-		printk(KERN_ERR "%s - ex111_init failed with %d",__func__,rv);
+		printk("%s - ex111_init failed with %d",__func__,rv);
 
 	rv = usb_submit_urb(ex111->irq, GFP_ATOMIC);
 	if (rv)
-		printk(KERN_ERR "%s - usb_submit_urb failed with result: %d", __func__, rv);
+		printk("%s - usb_submit_urb failed with result: %d", __func__, rv);
 }
 
 static void ex111_process_paket(struct ex111_usb *ex111, unsigned char *pkt)
 {
-
-	printk(KERN_ERR "function name  = %s\n", __func__);
+	printk("function name  = %s\n", __func__);
 	ex111->x = (pkt[4] << 8) | pkt[3];
 	ex111->y = (pkt[6] << 8) | pkt[5];
 	ex111->touch = (pkt[2] & 0x01) ? 1 : 0;
-	printk(KERN_ERR "%s - cal_x %d, cal_y %d", __func__, (pkt[4] << 8) | pkt[3],(pkt[6] << 8) | pkt[5]);
+	printk("%s - cal_x %d, cal_y %d", __func__, ((pkt[4] << 8) | pkt[3]),((pkt[6] << 8) | pkt[5]));
 
 	input_report_key(ex111->input, BTN_TOUCH, ex111->touch);
 
@@ -194,19 +296,19 @@ static void ex111_irq(struct urb *urb)
 	struct ex111_usb *ex111 = urb->context;
 	int retval;
 
-	printk(KERN_ERR "function name  = %s\n", __func__);
+	printk("function name  = %s\n", __func__);
 	switch (urb->status) {
 	case 0:
 		/* success */
-		printk(KERN_ERR "%s - usb_submit_urb with result: %d", __func__, urb->status);
+		printk("%s - usb_submit_urb with result: %d", __func__, urb->status);
 		break;
 	case -ETIME:
 		/* this urb is timing out */
-		printk(KERN_ERR "%s - urb timed out - was the device unplugged?",
+		printk("%s - urb timed out - was the device unplugged?",
 		    __func__);
 		return;
 	case -EPIPE:
-		printk(KERN_ERR "%s - urb stalled with status: %d, trying to resurrect",
+		printk("%s - urb stalled with status: %d, trying to resurrect",
 		    __func__, urb->status);
 		schedule_work(&ex111->reset_pipe_work);
 		return;
@@ -215,7 +317,7 @@ static void ex111_irq(struct urb *urb)
 	case -ESHUTDOWN:
 		return;
 	default:
-		printk(KERN_ERR "%s - nonzero urb status received: %d",
+		printk("%s - nonzero urb status received: %d",
 		    __func__, urb->status);
 		goto exit;
 	}
@@ -226,20 +328,46 @@ exit:
 	usb_mark_last_busy(interface_to_usbdev(ex111->interface));
 	retval = usb_submit_urb(urb, GFP_ATOMIC);
 	if (retval)
-		printk(KERN_ERR "%s - usb_submit_urb failed with result: %d", __func__, retval);
+		printk("%s - usb_submit_urb failed with result: %d", __func__, retval);
 }
-
 
 static int ex111_open(struct input_dev *input)
 {
 	struct ex111_usb *ex111 = input_get_drvdata(input);
-	printk(KERN_ERR "function name  = %s\n", __func__);
+	int r,i;
+	printk ("func name : %s, line no : %d\n", __func__, __LINE__);
 
-	ex111->irq->dev = ex111->usbdev;
-	if (usb_submit_urb(ex111->irq, GFP_KERNEL)) {
-		printk(KERN_ERR "%s - usb_submit_urb borked",__func__);
-		return -EIO;
+#if 1
+//	ex111->irq->dev = ex111->usbdev;
+#else
+	ex111->irq->dev = interface_to_usbdev(ex111->interface);
+
+	r = usb_autopm_get_interface(ex111->interface) ? -EIO : 0;
+	dbg("%s - usb_autopm_get_interface returned %d",__func__, r);
+	if (r < 0)
+		goto out;
+#endif
+
+	i = usb_submit_urb(ex111->irq, GFP_KERNEL);
+	if (i < 0) {
+		printk("%s - usb_submit_urb borked: %d",__func__, i);
+		r = -EIO;
+#if 0
+		goto out_put;
+#endif
 	}
+
+#if 0
+	ex111->interface->needs_remote_wakeup = 1;
+
+	out_put:
+		usb_autopm_put_interface(ex111->interface);
+
+	out:
+		dbg("%s - finally returning %d",__func__, r);
+		return r;
+#endif
+
 	return 0;
 }
 
@@ -249,7 +377,7 @@ static void ex111_close(struct input_dev *input)
 	struct ex111_usb *ex111 = input_get_drvdata(input);
 	int r;
 
-	printk(KERN_ERR "function name  = %s\n", __func__);
+	printk("function name  = %s\n", __func__);
 
 	usb_kill_urb(ex111->irq);
 	r = usb_autopm_get_interface(ex111->interface);
@@ -297,7 +425,7 @@ static int ex111_reset_resume(struct usb_interface *intf)
 	/* reinit the device */
 	err = ex111_init(ex111);
 	if (err) {
-		printk(KERN_ERR "%s - ex111_init() failed, err: %d",
+		printk("%s - ex111_init() failed, err: %d",
 				__func__, err);
 		return err;
 	}
@@ -316,13 +444,86 @@ ex111_get_input_endpoint(struct usb_host_interface *interface)
 {
 	int i;
 
-printk(KERN_ERR "function name  = %s\n", __func__);
+	printk("function name  = %s\n", __func__);
 
 	for (i = 0; i < interface->desc.bNumEndpoints; i++)
 		if (usb_endpoint_dir_in(&interface->endpoint[i].desc))
 			return &interface->endpoint[i].desc;
 
 	return NULL;
+}
+
+static int ex111_ioctl(struct usb_interface *intf, unsigned int cmd, void *arg)
+{
+	struct usb_device *udev = interface_to_usbdev(intf);
+	struct usb_packet *app_packet = arg;
+	int ret, i;
+	char *buf = app_packet->data_stage;
+
+	printk("func name : %s, line no : %d\n", __func__, __LINE__);
+
+	printk(
+			"\nDRIVER : ex111 data:\n request type : %x \n request : %d \n value : %x\n index : %x \n length : %d \n",
+			app_packet->bmRequestType, app_packet->bRequest, app_packet->wValue,
+			app_packet->wIndex, app_packet->wLength);
+
+	buf = (char *) kzalloc(32, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+
+	if (cmd == COMMAND_REQUEST) {
+		printk("func name : %s, line no : %d\n", __func__, __LINE__);
+
+		for (i = 0; i < 8; i++) {
+			buf[i] = app_packet->data_stage[i];
+		}
+
+		if (app_packet->bRequest == HID_REQ_SET_REPORT) {
+			printk("DRIVER : data stage : %x, %x, %x, %x, %x, %x, %x, %x\n",
+					buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6],
+					buf[7]);
+
+			ret = usb_control_msg(udev, usb_sndctrlpipe(udev, 0),
+			HID_REQ_SET_REPORT, app_packet->bmRequestType, app_packet->wValue,
+					app_packet->wIndex, (void *) buf, app_packet->wLength,
+					USB_CTRL_SET_TIMEOUT);
+
+			printk(
+					"%s - usb_control_msg - EX111_COMMAND_PROCESS - bytes|err: %d\n",
+					__func__, ret);
+
+			if (ret < 0)
+				goto ioctl_out;
+			else
+				goto get_report;
+		} else if (app_packet->bRequest == HID_REQ_GET_REPORT) {
+			goto get_report;
+		}
+	}
+	get_report: {
+		do {
+			msleep(100);
+			memset(buf, 0, 32);
+
+			ret = usb_control_msg(udev, usb_rcvctrlpipe(udev, 0),
+			HID_REQ_GET_REPORT,
+			USB_DIR_IN | USB_TYPE_CLASS | USB_RECIP_INTERFACE, 0x0380, 0,
+					(void *) buf, 0x14, USB_CTRL_SET_TIMEOUT);
+			printk("%s - usb_control_msg - EX111_STATUS_REQ - bytes|err: %d",
+					__func__, ret);
+		} while (buf[3] == 0x01);
+		printk("%s - EX111_STATUS_REQ buf[3]: %x", __func__, buf[3]);
+
+		if (ret < 0)
+			goto ioctl_out;
+	}
+
+	ioctl_out: kfree(buf);
+
+	if (ret < 0)
+		return ret;
+
+	return 0;
 }
 
 static int ex111_probe(struct usb_interface *intf,
@@ -333,21 +534,22 @@ static int ex111_probe(struct usb_interface *intf,
 	struct usb_endpoint_descriptor *endpoint;
 	struct usb_device *udev = interface_to_usbdev(intf);
 	int err = -ENOMEM;
-	int pipe, maxp;
+	int pipe;// maxp;
 
-	printk(KERN_ERR "function name  = %s\n", __func__);
+	printk("function name  = %s\n", __func__);
 
 	endpoint = ex111_get_input_endpoint(intf->cur_altsetting);
 	if (!endpoint)
 		return -ENXIO;
 
 	pipe = usb_rcvintpipe(udev, endpoint->bEndpointAddress);
-	maxp = usb_maxpacket(udev, pipe, usb_pipeout(pipe));
+//	maxp = usb_maxpacket(udev, pipe, usb_pipeout(pipe));
 
 	ex111 = kzalloc(sizeof(struct ex111_usb), GFP_KERNEL);
 	input_dev = input_allocate_device();
 	if (!ex111 || !input_dev)
 		goto out_free;
+
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,34)
 	ex111->data = usb_alloc_coherent(udev, REPT_SIZE, GFP_ATOMIC, &ex111->data_dma);
@@ -360,11 +562,13 @@ static int ex111_probe(struct usb_interface *intf,
 
 	ex111->irq = usb_alloc_urb(0, GFP_KERNEL);
 	if (!ex111->irq) {
-		printk(KERN_ERR "%s - usb_alloc_urb failed: ex111->irq", __func__);
+		printk("%s - usb_alloc_urb failed: ex111->irq", __func__);
 		goto out_free_buffers;
 	}
+	printk ("func name : %s, line no : %d\n", __func__, __LINE__);
 
-	ex111->usbdev = udev;
+
+//	ex111->usbdev = udev;
 	ex111->interface = intf;
 	ex111->input = input_dev;
 
@@ -383,6 +587,7 @@ static int ex111_probe(struct usb_interface *intf,
 			 le16_to_cpu(udev->descriptor.idVendor),
 			 le16_to_cpu(udev->descriptor.idProduct));
 
+
 	usb_make_path(udev, ex111->phys, sizeof(ex111->phys));
 
 	strlcat(ex111->phys, "/input0", sizeof(ex111->phys));
@@ -397,36 +602,41 @@ static int ex111_probe(struct usb_interface *intf,
 	input_dev->open = ex111_open;
 	input_dev->close = ex111_close;
 
+	printk ("func name : %s, line no : %d\n", __func__, __LINE__);
+
 	input_dev->evbit[0] = BIT_MASK(EV_KEY) | BIT_MASK(EV_ABS);
 	input_dev->keybit[BIT_WORD(BTN_TOUCH)] = BIT_MASK(BTN_TOUCH);
 	input_set_abs_params(input_dev, ABS_X, MIN_XC, MAX_XC, 0, 0);
 	input_set_abs_params(input_dev, ABS_Y, MIN_YC, MAX_YC, 0, 0);
 
-	ex111->intrpipe = usb_rcvintpipe(udev, endpoint->bEndpointAddress);
+//	ex111->intrpipe = usb_rcvintpipe(udev, endpoint->bEndpointAddress);
 	usb_fill_int_urb(ex111->irq, udev,
 			pipe,
-			ex111->data, (maxp > 8 ? 8 : maxp),
+			ex111->data, REPT_SIZE,
 			ex111_irq, ex111, endpoint->bInterval);
 
 	ex111->irq->dev = udev;
 	ex111->irq->transfer_dma = ex111->data_dma;
 	ex111->irq->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
 
-#ifdef CONFIG_USB_HID_MODULE
+#if 1//def CONFIG_USB_HID_MODULE
 	err = ex111_init(ex111);
 	if (err) {
-		printk(KERN_ERR "%s - ex111_init() failed, err: %d", __func__, err);
+		printk("%s - ex111_init() failed, err: %d", __func__, err);
 		goto out_do_exit;
 	}
 #endif
 
+	printk ("\nfunc name : %s, line no : %d\n", __func__, __LINE__);
+
 	err = input_register_device(ex111->input);
 	if (err) {
-		printk(KERN_ERR "%s - input_register_device() failed, err: %d", __func__, err);
+		printk("%s - input_register_device() failed, err: %d", __func__, err);
 		goto out_do_exit;
 	}
 
 	usb_set_intfdata(intf, ex111);
+	printk ("func name : %s, line no : %d\n", __func__, __LINE__);
 
 	INIT_WORK(&ex111->reset_pipe_work, reset_halted_pipe);
 
@@ -451,12 +661,12 @@ static void ex111_disconnect(struct usb_interface *intf)
 {
 	struct ex111_usb *ex111 = usb_get_intfdata(intf);
 
-	printk(KERN_ERR "function name  = %s\n", __func__);
+	printk("function name  = %s\n", __func__);
 
 	if (!ex111)
 		return;
 
-	printk(KERN_ERR "%s - ex111 is initialized, cleaning up", __func__);
+	printk("%s - ex111 is initialized, cleaning up", __func__);
 	usb_set_intfdata(intf, NULL);
 	/* this will stop IO via close */
 	input_unregister_device(ex111->input);
@@ -479,7 +689,7 @@ static struct usb_driver ex111_driver =
 	.suspend	= ex111_suspend,
 	.resume		= ex111_resume,
 	.reset_resume	= ex111_reset_resume,
-	.
+	.unlocked_ioctl = ex111_ioctl,
 	.supports_autosuspend = 1,
 };
 
@@ -487,7 +697,7 @@ static int __init ex111_modinit(void)
 {
 	int retval = usb_register(&ex111_driver);
 	if (retval == 0)
-		printk(KERN_INFO KBUILD_MODNAME ": " DRIVER_VERSION ":"
+		printk(KBUILD_MODNAME ": " DRIVER_VERSION ":"
 				DRIVER_DESC "\n");
 	return retval;
 }
